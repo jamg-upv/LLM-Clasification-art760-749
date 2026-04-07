@@ -1,0 +1,866 @@
+---
+title: "ART-760 baseline class"
+format: html
+editor: visual
+---
+
+# How To cite
+
+
+# Input Excel file
+
+The working Excel file serves as both the input and output container for the entire procedure. It must contain the following sheets:
+
+**`Spec`** — Defines the corpus parameters for synthetic generation. Required columns: `n_items` (total number of items, entered only in the first row), `Label` (one row per label level), and `Proportion` (relative frequency of each label, need not sum exactly to 1 as the module renormalises automatically). This sheet is read by Module 1 and ignored by all subsequent modules.
+
+**`Corpus`** — Contains the labelled dataset. Required columns: `ID` (unique item identifier) and `Label` (category assigned to each item). Optional columns: `Title` and `Abstract`. This sheet is written by Module 1 if generating a synthetic corpus, or populated manually by the user if working with a real dataset. If this sheet already contains data when Module 1 runs, synthetic generation is skipped entirely.
+
+**`Simulations`** — Receives the simulated classification vectors produced by Module 3. Leave blank before the first run. If it already contains data from a previous run, Module 3 will skip the simulation step and proceed directly to metric calculation using the existing data.
+
+**`Reporting`** — Receives the metric summary table produced by Module 4. Overwritten on each run.
+
+The file can be used in two ways: starting from a `Spec`-only file with an empty `Corpus` sheet (synthetic mode, run all modules in order), or starting from a file with a pre-populated `Corpus` sheet (real dataset mode, skip Module 1).
+
+# Module 0 — Setup & file selection
+
+This module handles all session-level configuration. It installs and loads any missing packages, defines all global parameters (file names, label mappings, iteration count, random seed, and sheet names), and resolves the path to the working Excel file. Path resolution follows a three-step priority: if `EXCEL_PATH` is explicitly set and the file exists, it is used directly; if only `EXCEL_FILE` is provided, the path is built from the `.qmd` directory; if neither is set or the file is not found, a native RStudio file picker dialog opens. All downstream modules consume `EXCEL_PATH` without modification.
+
+
+
+```{r module-00-setup}
+
+# ******************************************
+# Packages
+# ******************************************
+.ensure_packages <- function(pkgs) {
+  missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing)) install.packages(missing, repos = "https://cloud.r-project.org")
+  invisible(lapply(pkgs, library, character.only = TRUE))
+}
+
+.ensure_packages(c("openxlsx", "dplyr", "purrr", "tibble", "rstudioapi"))
+# ******************************************
+
+# ******************************************
+# Parameters
+# ******************************************
+EXCEL_PATH <- NULL          # "C:/full/path/to/file.xlsx"  |  NULL → resolve below
+EXCEL_FILE <- "ART-760_alfalla19.xlsx"        # "ART760_template.xlsx"            |  NULL → without "" file picker
+POS_LABELS <- "included"   # label(s) mapped to POSITIVE — use c("a","b") for multiple
+NEG_LABELS <- "excluded"   # label(s) mapped to NEGATIVE — use c("a","b") for multiple
+N_ITER     <- 10000L    # L forces R to save number as integer (more semantic congruence for counters and less memory)
+SEED       <- 34L       # Comment if no Seed Needed L forces R to save number as integer (more semantic congruence for counters and less memory)
+
+SH_SPEC <- "Spec"
+SH_CORP <- "Corpus"
+SH_SIMS <- "Simulations"
+SH_REP  <- "Reporting"
+# ******************************************
+
+# ******************************************
+# Resolve Excel path
+# ******************************************
+script_dir <- tryCatch(
+  dirname(rstudioapi::getSourceEditorContext()$path),
+  error = function(e) getwd()
+)
+
+.resolve_excel <- function(excel_path, filename, dir) {
+
+  # 1. Full path provided and valid → use directly
+  if (!is.null(excel_path) && nzchar(excel_path)) {
+    if (!file.exists(excel_path)) stop("EXCEL_PATH not found: ", excel_path)
+    message("✔ Using EXCEL_PATH: ", excel_path)
+    return(excel_path)
+  }
+
+  # 2. Filename provided → build path from script_dir
+  if (!is.null(filename) && nzchar(filename)) {
+    full_path <- file.path(dir, filename)
+    if (file.exists(full_path)) {
+      message("✔ File found: ", basename(full_path))
+      return(full_path)
+    }
+    message("⚠ '", filename, "' not found in ", dir, ". Opening file picker…")
+  }
+
+  # 3. Neither provided or file not found → native file picker
+  chosen <- rstudioapi::selectFile(
+    caption = "Select the scenario Excel file",
+    path    = dir,
+    filter  = "Excel files (*.xlsx)"
+  )
+  if (is.null(chosen) || !nzchar(chosen)) stop("No file selected.")
+  if (!file.exists(chosen))               stop("File not found: ", chosen)
+
+  message("✔ Selected: ", basename(chosen))
+  chosen
+}
+
+EXCEL_PATH <- .resolve_excel(EXCEL_PATH, EXCEL_FILE, script_dir)
+message("   Working directory: ", script_dir)
+# ******************************************
+```
+
+# Module 1 — Synthetic corpus generation
+
+This module generates a synthetic labelled corpus from the parameters defined in the `Spec` sheet and writes it to the `Corpus` sheet of a new Excel file. It is intended for testing and validation purposes before applying the procedure to a real dataset. The module first checks whether the `Corpus` sheet already contains data — if so, it skips execution entirely and preserves the current `EXCEL_PATH`. If the corpus is empty, it reads `n_items`, label names, and proportions from `Spec`, generates a randomised label vector respecting the specified distribution, and writes the resulting corpus to a new file named `[original]_synthetic.xlsx`, updating `EXCEL_PATH` accordingly so all subsequent modules point to the correct file.
+
+```{r module-01-synth-corpus}
+# Generates a synthetic corpus from the Spec sheet and writes it to the Corpus
+# sheet. Automatically skipped if Corpus already contains data.
+
+# ******************************************
+# Check — skip if Corpus already has data
+# ******************************************
+.corpus_existing <- tryCatch(
+  openxlsx::read.xlsx(EXCEL_PATH, sheet = SH_CORP),
+  error = function(e) NULL
+)
+
+.skip_m1 <- !is.null(.corpus_existing) && nrow(.corpus_existing) > 0
+
+if (.skip_m1) {
+  message("⚠ Module 1 skipped: Corpus sheet already contains ",
+          nrow(.corpus_existing), " rows. Proceed to Module 2.")
+  message("  Label distribution in existing corpus:")
+  print(as.data.frame(dplyr::count(.corpus_existing, Label)))
+}
+
+rm(.corpus_existing)
+# ******************************************
+
+if (!.skip_m1) {
+
+  # ******************************************
+  # Read Spec
+  # ******************************************
+  spec_df <- openxlsx::read.xlsx(EXCEL_PATH, sheet = SH_SPEC)
+  
+  required_spec <- c("n_items", "Label", "Proportion")
+  missing_spec  <- setdiff(required_spec, names(spec_df))
+  if (length(missing_spec))
+    stop("Spec sheet missing columns: ", paste(missing_spec, collapse = ", "))
+  
+  spec_df  <- spec_df |> dplyr::filter(!is.na(Label), !is.na(Proportion))
+  
+  n_items  <- as.integer(spec_df$n_items[1])
+  levels_k <- spec_df$Label
+  probs_k  <- spec_df$Proportion / sum(spec_df$Proportion)
+  
+  if (abs(sum(spec_df$Proportion) - 1) > 0.01)
+    warning("Spec proportions did not sum to 1 — renormalised automatically.")
+  
+  message("Spec loaded: ", n_items, " items | ",
+          length(levels_k), " labels: ",
+          paste(levels_k, round(probs_k, 3), sep = "=", collapse = " | "))
+  # ******************************************
+
+  # ******************************************
+  # Generate synthetic corpus
+  # ******************************************
+  set.seed(SEED)
+
+  counts    <- round(probs_k * n_items)
+  counts[1] <- n_items - sum(counts[-1])
+
+  label_vec    <- sample(rep(levels_k, times = counts))
+  corpus_synth <- tibble::tibble(
+    ID       = seq_len(n_items),
+    Title    = paste("Synthetic reference", seq_len(n_items)),
+    Abstract = paste("Abstract placeholder for item", seq_len(n_items)),
+    Label    = label_vec
+  )
+
+  message("Synthetic corpus generated:")
+  print(dplyr::count(corpus_synth, Label), n = Inf)
+  # ******************************************
+
+  # ******************************************
+  # Write to Excel
+  # ******************************************
+  wb <- openxlsx::loadWorkbook(EXCEL_PATH)
+
+  if (SH_CORP %in% names(wb)) openxlsx::removeWorksheet(wb, SH_CORP)
+  openxlsx::addWorksheet(wb, SH_CORP)
+
+  hs <- openxlsx::createStyle(textDecoration = "bold",
+                               fgFill = "#E2EFDA", border = "Bottom")
+  openxlsx::writeData(wb, SH_CORP, corpus_synth, headerStyle = hs)
+  openxlsx::setColWidths(wb, SH_CORP, cols = seq_len(ncol(corpus_synth)),
+                          widths = "auto")
+
+  synth_path <- sub("\\.xlsx$", "_synthetic.xlsx", EXCEL_PATH, ignore.case = TRUE)
+  openxlsx::saveWorkbook(wb, synth_path, overwrite = TRUE)
+  EXCEL_PATH <- synth_path
+  message("✔ Synthetic corpus written to '", basename(EXCEL_PATH), "'")
+  # ******************************************
+
+}
+```
+# Module 2 — Corpus reading & validation
+
+This module reads the `Corpus` and `Spec` sheets from the working Excel file and prepares all objects required by the simulation and reporting modules. It validates that the mandatory columns (`ID` and `Label`) are present in the corpus, warns about missing optional columns (`Title`, `Abstract`), and checks that all label values can be mapped to the binary positive/negative scheme defined by `POS_LABELS` and `NEG_LABELS` in Module 0. Any unmapped label is flagged with a warning and set to `NA` in `label_bin`. The Spec sheet is also read and validated here, with proportions renormalised if they do not sum exactly to 1. The module closes with a corpus summary showing total items, positive and negative counts with percentages, and the imbalance ratio.
+
+This module is kept separate from Module 1 for two reasons. First, when working with a real dataset the user populates the `Corpus` sheet manually and skips Module 1 entirely — Module 2 is then the natural entry point of the pipeline. Second, separating reading and validation from simulation makes it easy to re-run the validation step in isolation if the corpus or label mappings change without triggering the simulation again.
+
+```{r module-02-read-validate}
+# Reads and validates the Corpus and Spec sheets. Binarises labels into
+# positive / negative. Outputs corpus_df, spec_df, n_items, levels_k, probs_k.
+
+# ******************************************
+# Read Corpus
+# ******************************************
+corpus_raw <- openxlsx::read.xlsx(EXCEL_PATH, sheet = SH_CORP)
+
+required_cols <- c("ID", "Label")
+optional_cols <- c("Title", "Abstract")
+
+missing_req <- setdiff(required_cols, names(corpus_raw))
+if (length(missing_req))
+  stop("Corpus sheet missing required columns: ", paste(missing_req, collapse = ", "))
+
+missing_opt <- setdiff(optional_cols, names(corpus_raw))
+if (length(missing_opt))
+  warning("Corpus sheet missing optional columns: ", paste(missing_opt, collapse = ", "))
+
+message("Corpus loaded: ", nrow(corpus_raw), " rows | ",
+        ncol(corpus_raw), " columns")
+# ******************************************
+
+# ******************************************
+# Binarise labels
+# ******************************************
+unknown_labels <- setdiff(unique(corpus_raw$Label), c(POS_LABELS, NEG_LABELS))
+if (length(unknown_labels))
+  warning("Unknown label(s) — will be set to NA in label_bin: ",
+          paste(unknown_labels, collapse = ", "))
+
+corpus_df <- corpus_raw |>
+  dplyr::mutate(
+    label_bin = dplyr::case_when(
+      Label %in% POS_LABELS ~ "positive",
+      Label %in% NEG_LABELS ~ "negative",
+      TRUE                  ~ NA_character_
+    )
+  )
+
+n_pos <- sum(corpus_df$label_bin == "positive", na.rm = TRUE)
+n_neg <- sum(corpus_df$label_bin == "negative", na.rm = TRUE)
+n_na  <- sum(is.na(corpus_df$label_bin))
+
+message("Label binarisation: ", n_pos, " positive | ",
+        n_neg, " negative | ", n_na, " NA")
+# ******************************************
+
+# ******************************************
+# Read Spec
+# ******************************************
+spec_df <- openxlsx::read.xlsx(EXCEL_PATH, sheet = SH_SPEC)
+
+required_spec <- c("n_items", "Label", "Proportion")
+missing_spec  <- setdiff(required_spec, names(spec_df))
+if (length(missing_spec))
+  stop("Spec sheet missing columns: ", paste(missing_spec, collapse = ", "))
+
+# Remove empty rows (n_items is only filled in the first row by design)
+spec_df <- spec_df |>
+  dplyr::filter(!is.na(Label), !is.na(Proportion))
+
+n_items  <- as.integer(spec_df$n_items[1])
+levels_k <- spec_df$Label
+probs_k  <- spec_df$Proportion / sum(spec_df$Proportion)
+
+if (abs(sum(spec_df$Proportion) - 1) > 0.01)
+  warning("Spec proportions did not sum to 1 — renormalised automatically.")
+
+message("Spec loaded: ", length(levels_k), " label levels | ",
+        paste(levels_k, round(probs_k, 3), sep = "=", collapse = " | "))
+# ******************************************
+
+# ******************************************
+# Corpus summary
+# ******************************************
+message("─── Corpus summary ───────────────────────────────")
+message("  Total items   : ", nrow(corpus_df))
+message("  Positive (n)  : ", n_pos, " (", round(n_pos / nrow(corpus_df) * 100, 1), "%)")
+message("  Negative (n)  : ", n_neg, " (", round(n_neg / nrow(corpus_df) * 100, 1), "%)")
+message("  NA label_bin  : ", n_na)
+message("  Imbalance ratio (neg/pos): ", round(n_neg / n_pos, 2))
+message("──────────────────────────────────────────────────")
+# ******************************************
+```
+
+# Module 3 — Monte Carlo simulation
+This module generates N_ITER simulated classification vectors for the corpus, using the label distribution defined in the Spec sheet (levels_k and probs_k). Each iteration produces one random classification of all items, stored as a column (iter_0001, iter_0002, …) with ID as the first column. Results are written to the Simulations sheet, overwriting any existing data. If you want to preserve a previous simulation run and proceed directly to Module 4, simply do not execute this chunk.
+
+```{r module-03-simulate}
+# Generates N_ITER simulated classification vectors and writes them to the
+# Simulations sheet (overwrites any existing data).
+# To skip simulation and reuse a previous run: do NOT execute this chunk.
+
+# ******************************************
+# Run simulation
+# ******************************************
+set.seed(SEED)
+
+message("Running ", N_ITER, " iterations × ", nrow(corpus_df), " items…")
+
+.sim_matrix <- matrix(
+  sample(levels_k, size = nrow(corpus_df) * N_ITER,
+         replace = TRUE, prob = probs_k),
+  nrow = nrow(corpus_df),
+  ncol = N_ITER
+)
+
+colnames(.sim_matrix) <- sprintf("iter_%04d", seq_len(N_ITER))
+
+sims_df <- tibble::tibble(ID = corpus_df$ID,
+                           as.data.frame(.sim_matrix))
+rm(.sim_matrix)
+
+message("✔ Simulation complete: ", nrow(sims_df), " items × ",
+        N_ITER, " iterations")
+# ******************************************
+
+# ******************************************
+# Write to Excel
+# ******************************************
+message("Writing to Excel…")
+
+wb <- openxlsx::loadWorkbook(EXCEL_PATH)
+
+if (SH_SIMS %in% names(wb)) openxlsx::removeWorksheet(wb, SH_SIMS)
+openxlsx::addWorksheet(wb, SH_SIMS)
+
+hs <- openxlsx::createStyle(textDecoration = "bold",
+                             fgFill = "#FFF2CC", border = "Bottom")
+openxlsx::writeData(wb, SH_SIMS, sims_df, headerStyle = hs)
+
+openxlsx::saveWorkbook(wb, EXCEL_PATH, overwrite = TRUE)
+message("✔ Simulations written to sheet '", SH_SIMS, "' in ",
+        basename(EXCEL_PATH))
+# ******************************************
+```
+
+# [OPTIONAL] Validation module — Known-case simulation
+This module is not part of the main pipeline and does not affect any results. It is designed to verify that the metric calculations in Module 4 are correct by constructing four classification vectors with known outcomes: all_positive (every item classified as positive), all_negative (every item classified as negative), perfect (identical to the gold standard), and random_fair (random 50/50 assignment regardless of corpus prevalence). These four vectors overwrite the Simulations sheet and are loaded as sims_df so that Module 4 can be run immediately after without any other change. Run this module, then Module 4, then the Validation check module below.
+
+```{r validation-known-cases}
+# VALIDATION MODULE — not part of the main pipeline.
+# Generates four known-outcome vectors and overwrites the Simulations sheet
+# so Module 4 can be run to verify metric calculations.
+#
+# Expected results:
+#   all_positive : Recall=1, Specificity=0, Precision=prevalence, MCC=0
+#   all_negative : Recall=0, Specificity=1, Precision=NA,         MCC=0
+#   perfect      : all metrics=1, MCC=1
+#   random_fair  : BalancedAccuracy≈0.5, MCC≈0
+
+# ******************************************
+# Build validation vectors
+# ******************************************
+set.seed(SEED)
+n <- nrow(corpus_df)
+
+val_df <- tibble::tibble(
+  ID           = corpus_df$ID,
+  all_positive = POS_LABELS[1],
+  all_negative = NEG_LABELS[1],
+  perfect      = corpus_df$Label,
+  random_fair  = sample(c(POS_LABELS[1], NEG_LABELS[1]),
+                        size = n, replace = TRUE, prob = c(0.5, 0.5))
+)
+
+message("Validation dataset built: ", n, " items × 4 cases")
+message("  all_positive : all items classified as '", POS_LABELS[1], "'")
+message("  all_negative : all items classified as '", NEG_LABELS[1], "'")
+message("  perfect      : identical to gold standard")
+message("  random_fair  : random 50/50 regardless of prevalence")
+# ******************************************
+
+# ******************************************
+# Overwrite Simulations sheet
+# ******************************************
+wb <- openxlsx::loadWorkbook(EXCEL_PATH)
+
+if (SH_SIMS %in% names(wb)) openxlsx::removeWorksheet(wb, SH_SIMS)
+openxlsx::addWorksheet(wb, SH_SIMS)
+
+hs <- openxlsx::createStyle(textDecoration = "bold",
+                              fgFill = "#FFE0CC", border = "Bottom")
+openxlsx::writeData(wb, SH_SIMS, val_df, headerStyle = hs)
+openxlsx::setColWidths(wb, SH_SIMS, cols = seq_len(ncol(val_df)),
+                        widths = "auto")
+
+openxlsx::saveWorkbook(wb, EXCEL_PATH, overwrite = TRUE)
+
+# Expose as sims_df so Module 4 can consume it directly
+sims_df <- val_df
+
+message("✔ Validation cases written to '", SH_SIMS, "' and loaded as sims_df")
+message("  → Now run Module 4 to verify metrics")
+# ******************************************
+```
+
+
+# Module 4 — Metric computation & reporting
+
+This module computes eight classification metrics — Recall, Specificity, Precision, NPV, F1, F2, Balanced Accuracy, and MCC — for each simulated iteration in `sims_df`. For each iteration, the simulated label vector is binarised into positive/negative using the same mapping defined in Module 0, the confusion matrix is computed against the gold standard `label_bin` from `corpus_df`, and the eight metrics are derived. Degenerate cases where the denominator is zero are handled explicitly and recorded as `NA`. Once all iterations are processed, the empirical distribution of each metric is summarised with mean, median, standard deviation, and a 95% confidence interval computed by the percentile method (2.5th and 97.5th percentiles). The summary table is written to the `Reporting` sheet and stored as `report_df` in the global environment.
+
+## Interpreting the results
+The output of this module is not a measure of classifier performance — it is the empirical baseline that a random classifier would achieve given the label distribution of the corpus. Two results serve as internal sanity checks: 
+Balanced Accuracy should converge to 0.50 and MCC should converge to 0 as the number of iterations increases, since a random classifier has no discriminative capacity. 
+Deviations from these values in small iteration runs (e.g. 10 iterations) are expected due to sampling variance and will stabilise at 10,000 iterations. 
+The 95% CI quantifies the range within which a random classifier would fall 95% of the time — any real classifier scoring above the upper bound of Recall, F1, or Balanced Accuracy can be considered to beat chance for that metric. The NA percentage reported for F1 and F2 reflects iterations where the simulated classifier assigned no positive labels at all, a degenerate but statistically possible outcome under low-prevalence distributions that disappears with sufficient iterations.
+```{r module-04-report}
+# Computes 8 classification metrics for each simulation iteration,
+# then summarises the empirical distribution with mean, median, SD and
+# 95% CI by percentile method. Writes results to the Reporting sheet.
+
+# ******************************************
+# Helper functions
+# ******************************************
+.binarise <- function(x, pos, neg) {
+  dplyr::case_when(
+    x %in% pos ~ "positive",
+    x %in% neg ~ "negative",
+    TRUE        ~ NA_character_
+  )
+}
+
+.confusion <- function(pred, truth) {
+  list(
+    tp = sum(pred == "positive" & truth == "positive", na.rm = TRUE),
+    tn = sum(pred == "negative" & truth == "negative", na.rm = TRUE),
+    fp = sum(pred == "positive" & truth == "negative", na.rm = TRUE),
+    fn = sum(pred == "negative" & truth == "positive", na.rm = TRUE)
+  )
+}
+
+.metrics <- function(cm) {
+  with(cm, {
+    recall  <- if ((tp + fn) > 0) tp / (tp + fn)         else NA_real_
+    spec    <- if ((tn + fp) > 0) tn / (tn + fp)         else NA_real_
+    prec    <- if ((tp + fp) > 0) tp / (tp + fp)         else NA_real_
+    npv     <- if ((tn + fn) > 0) tn / (tn + fn)         else NA_real_
+    f1      <- if (!is.na(prec) && !is.na(recall) &&
+                   (prec + recall) > 0)
+                 2 * prec * recall / (prec + recall)      else NA_real_
+    f2      <- if (!is.na(prec) && !is.na(recall) &&
+                   (4 * prec + recall) > 0)
+                 5 * prec * recall / (4 * prec + recall)  else NA_real_
+    bal_acc <- if (!is.na(recall) && !is.na(spec))
+                 (recall + spec) / 2                      else NA_real_
+    # as.numeric() applied to each factor before multiplication prevents integer
+    # overflow (R integers are capped at 2^31). Without it, large corpora cause
+    # the product to exceed the integer limit and return NA.
+    mcc_den <- sqrt(as.numeric(tp+fp) * as.numeric(tp+fn)*as.numeric(tn+fp) * as.numeric(tn+fn))
+    mcc     <- if (mcc_den > 0) (tp*tn - fp*fn) / mcc_den else NA_real_
+
+    c(Recall = recall, Specificity = spec, Precision = prec, NPV = npv,
+      F1 = f1, F2 = f2, BalancedAccuracy = bal_acc, MCC = mcc)
+  })
+}
+# ******************************************
+
+# ******************************************
+# Compute metrics per iteration
+# ******************************************
+truth     <- corpus_df$label_bin
+iter_cols <- setdiff(names(sims_df), "ID")
+
+message("Computing metrics for ", length(iter_cols), " iterations…")
+
+metrics_mat <- purrr::map(iter_cols, function(col) {
+  pred <- .binarise(sims_df[[col]], POS_LABELS, NEG_LABELS)
+  cm   <- .confusion(pred, truth)
+  .metrics(cm)
+}) |>
+  (\(x) as.data.frame(do.call(rbind, x)))()
+
+message("✔ Metrics computed: ", nrow(metrics_mat), " iterations × ",
+        ncol(metrics_mat), " metrics")
+# ******************************************
+
+# ******************************************
+# Summarise empirical distributions
+# ******************************************
+metric_names <- c("Recall", "Specificity", "Precision", "NPV",
+                   "F1", "F2", "BalancedAccuracy", "MCC")
+
+report_df <- purrr::map_dfr(metric_names, function(m) {
+  vals <- metrics_mat[, m]
+  tibble::tibble(
+    Metric   = m,
+    Mean     = mean(vals, na.rm = TRUE),
+    Median   = median(vals, na.rm = TRUE),
+    SD       = sd(vals, na.rm = TRUE),
+    CI95_Lo  = quantile(vals, 0.025, na.rm = TRUE),
+    CI95_Hi  = quantile(vals, 0.975, na.rm = TRUE),
+    NA_pct   = round(mean(is.na(vals)) * 100, 1)
+  )
+})
+
+message("─── Empirical baseline summary ───────────────────")
+print(as.data.frame(report_df))
+message("──────────────────────────────────────────────────")
+# ******************************************
+
+# ******************************************
+# Write to Excel
+# ******************************************
+wb <- openxlsx::loadWorkbook(EXCEL_PATH)
+
+if (SH_REP %in% names(wb)) openxlsx::removeWorksheet(wb, SH_REP)
+openxlsx::addWorksheet(wb, SH_REP)
+
+hs <- openxlsx::createStyle(textDecoration = "bold",
+                              fgFill = "#DCE6F1", border = "Bottom")
+num_style <- openxlsx::createStyle(numFmt = "0.0000")
+
+openxlsx::writeData(wb, SH_REP, report_df, headerStyle = hs)
+openxlsx::addStyle(wb, SH_REP, num_style,
+                    rows = 2:(nrow(report_df) + 1),
+                    cols = 2:(ncol(report_df) - 1),
+                    gridExpand = TRUE)
+openxlsx::setColWidths(wb, SH_REP, cols = seq_len(ncol(report_df)),
+                        widths = "auto")
+
+openxlsx::saveWorkbook(wb, EXCEL_PATH, overwrite = TRUE)
+message("✔ Report written to sheet '", SH_REP, "' in ", basename(EXCEL_PATH))
+# ******************************************
+```
+
+
+# [OPTIONAL] Per-case metric verification
+This module is not part of the main pipeline. It reads metrics_mat and sims_df produced by the most recent Module 4 run and displays the confusion matrix (TP, TN, FP, FN) and eight metrics for each classifier or iteration, labelled by column name. Although it is designed to be run after the validation module to verify known-outcome cases, it works after any Module 4 execution and can be used to inspect individual classifier results in detail. To save the inspection table to the Excel file, run the inspection-save chunk afterwards.
+
+```{r inspection}
+# Displays confusion matrix and 8 metrics for each classifier/iteration
+# from the most recent Module 4 run. Works after any Module 4 execution.
+# Set SAVE_INSPECTION <- TRUE to write the full table to Excel.
+
+# ******************************************
+# Parameters
+# ******************************************
+SAVE_INSPECTION <- FALSE   # TRUE → writes to Inspection sheet in Excel
+# ******************************************
+
+# ******************************************
+# Helper functions
+# ******************************************
+.binarise_vec <- function(x, pos, neg) {
+  dplyr::case_when(
+    x %in% pos ~ "positive",
+    x %in% neg ~ "negative",
+    TRUE        ~ NA_character_
+  )
+}
+
+.confusion_counts <- function(pred, truth) {
+  list(
+    TP = sum(pred == "positive" & truth == "positive", na.rm = TRUE),
+    TN = sum(pred == "negative" & truth == "negative", na.rm = TRUE),
+    FP = sum(pred == "positive" & truth == "negative", na.rm = TRUE),
+    FN = sum(pred == "negative" & truth == "positive", na.rm = TRUE)
+  )
+}
+# ******************************************
+
+# ******************************************
+# Build per-classifier inspection table
+# ******************************************
+truth     <- corpus_df$label_bin
+iter_cols <- setdiff(names(sims_df), "ID")
+
+inspection_df <- purrr::map_dfr(seq_along(iter_cols), function(i) {
+  col  <- iter_cols[i]
+  pred <- .binarise_vec(sims_df[[col]], POS_LABELS, NEG_LABELS)
+  cm   <- .confusion_counts(pred, truth)
+
+  tibble::tibble(
+    Classifier       = col,
+    TP               = cm$TP,
+    TN               = cm$TN,
+    FP               = cm$FP,
+    FN               = cm$FN,
+    Recall           = metrics_mat[i, "Recall"],
+    Specificity      = metrics_mat[i, "Specificity"],
+    Precision        = metrics_mat[i, "Precision"],
+    NPV              = metrics_mat[i, "NPV"],
+    F1               = metrics_mat[i, "F1"],
+    F2               = metrics_mat[i, "F2"],
+    BalancedAccuracy = metrics_mat[i, "BalancedAccuracy"],
+    MCC              = metrics_mat[i, "MCC"]
+  )
+})
+
+message("─── Per-classifier inspection (", nrow(inspection_df),
+        " rows) ───────────────")
+print_df <- inspection_df |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 4)))
+print(as.data.frame(print_df), row.names = FALSE)
+message("──────────────────────────────────────────────────")
+# ******************************************
+
+```
+
+# [OPTIONAL] SAVE results in excel Per-case metric verification- 
+```{r inspection-save-to-excel}
+# Writes the inspection table to the Inspection sheet in the Excel file.
+# Only run this chunk if you want to save the inspection results to Excel.
+# Requires inspection_df in the global environment (run inspection chunk first).
+
+# ******************************************
+# Write Inspection to Excel
+# ******************************************
+SH_INS <- "Inspection"
+wb     <- openxlsx::loadWorkbook(EXCEL_PATH)
+
+if (SH_INS %in% names(wb)) openxlsx::removeWorksheet(wb, SH_INS)
+openxlsx::addWorksheet(wb, SH_INS)
+
+hs <- openxlsx::createStyle(textDecoration = "bold",
+                              fgFill = "#EAD1DC", border = "Bottom")
+num_style <- openxlsx::createStyle(numFmt = "0.0000")
+
+openxlsx::writeData(wb, SH_INS, inspection_df, headerStyle = hs)
+openxlsx::addStyle(wb, SH_INS, num_style,
+                    rows = 2:(nrow(inspection_df) + 1),
+                    cols = 6:ncol(inspection_df),
+                    gridExpand = TRUE)
+openxlsx::setColWidths(wb, SH_INS,
+                        cols = seq_len(ncol(inspection_df)), widths = "auto")
+
+openxlsx::saveWorkbook(wb, EXCEL_PATH, overwrite = TRUE)
+message("✔ Inspection table written to sheet '", SH_INS, "' in ",
+        basename(EXCEL_PATH))
+# ******************************************
+```
+
+
+# Output Excel file description
+The output Excel file shares the same structure as the input file and is updated in place at the end of each module. By the end of a complete pipeline run it contains the following sheets:
+Spec — Unchanged from the input. Contains the corpus parameters used to generate the synthetic corpus and define the simulation distribution.
+Corpus — The labelled dataset used as gold standard. Populated either by Module 1 (synthetic generation) or manually by the user. Contains at minimum ID and Label, optionally Title and Abstract.
+Simulations — Contains the full Monte Carlo simulation matrix: one row per corpus item, one column per iteration (iter_0001 … iter_N), plus an ID column. Written by Module 3. If Module 3 is skipped this sheet retains its previous content, which Module 4 reads directly.
+Reporting — Contains the empirical baseline summary table, one row per metric. Columns: Metric, Mean, Median, SD, CI95_Lo, CI95_Hi, NA_pct. Written by Module 4 and overwritten on each run.
+Validation (optional) — Written only if the validation check chunk is executed. Contains the per-case metric results for the four known-outcome vectors, used to verify the correctness of the metric calculations before applying the procedure to real data.
+
+# [OPTIONAL] EXTRA Heterogeneous classifiers module
+This module is not part of the main pipeline. It generates a synthetic dataset of heterogeneous classifiers simulating human reviewers with different labelling biases, and is intended for testing and exploratory analysis. Each classifier is represented as a column in the Simulations sheet, where each cell contains the label assigned by that classifier to each corpus item.Classifiers are generated under two modes controlled by PROFILE. In "fixed" mode, classifiers are distributed across six predefined bias profiles: lenient (tends to assign positive), strict (tends to assign negative), random (pure 50/50), prevalence (mirrors corpus prevalence), biased_pos (strong positive bias) and biased_neg (strong negative bias). In "random" mode, each classifier receives a randomly drawn positive assignment probability within P_POS_RANGE, producing a continuous spectrum of reviewer biases. The number of classifiers is controlled by N_CLASSIFIERS.
+
+Start with module 
+then this module checks whether corpus_df already exists in the environment and matches the Spec before proceeding, preventing silent use of a stale corpus from a previous run. If the Corpus sheet is empty it generates a synthetic corpus from Spec using the same logic as Module 1. Results are saved to a new file with the suffix _hetero.xlsx to preserve the original, and EXCEL_PATH is updated accordingly.
+After this module, proceed directly to Module 4 — Modules 1, 2 and 3 will auto-bypass.
+
+```{r heterogeneous-classifiers}
+# Generates a synthetic dataset of heterogeneous classifiers simulating human
+# reviewers with different labelling biases. Intended to replace the
+# Simulations sheet so Module 4 can be run directly after this chunk.
+#
+# Corpus handling:
+#   - If Corpus sheet already has data → loaded as-is
+#   - If Corpus sheet is empty         → generated from Spec (same logic as Module 1)
+#
+# After this chunk: corpus_df and sims_df are ready in the global environment.
+# Proceed directly to Module 4 — Modules 1, 2 and 3 will auto-bypass.
+
+# ******************************************
+# Parameters
+# ******************************************
+N_CLASSIFIERS <- 20L
+# Number of classifier columns to generate. Each column simulates one human
+# reviewer with its own labelling bias.
+
+PROFILE <- "fixed"
+# "fixed"  — classifiers are distributed across 6 predefined bias profiles
+#            (lenient, strict, random, prevalence, biased_pos, biased_neg)
+#            cycling through them until N_CLASSIFIERS is reached.
+#            Ensures all bias types are represented.
+# "random" — each classifier gets a random p_pos drawn from P_POS_RANGE.
+#            More realistic for a continuous spectrum of reviewer biases.
+
+P_POS_RANGE <- c(0.05, 0.95)
+# Only used when PROFILE = "random".
+# Defines the range from which each classifier's probability of assigning
+# a positive label is drawn. c(0.05, 0.95) covers the full spectrum from
+# very strict to very lenient reviewers.
+# ******************************************
+
+# ******************************************
+# Sanity check — corpus_df vs Spec
+# ******************************************
+# If corpus_df already exists in the environment, verify it matches the Spec
+# before proceeding. Prevents silent use of a stale corpus from a previous run.
+if (exists("corpus_df")) {
+  .spec_check <- tryCatch(
+    openxlsx::read.xlsx(EXCEL_PATH, sheet = SH_SPEC),
+    error = function(e) NULL
+  )
+  if (!is.null(.spec_check)) {
+    .expected_n <- as.integer(.spec_check$n_items[1])
+    if (nrow(corpus_df) != .expected_n) {
+      warning("corpus_df in environment has ", nrow(corpus_df),
+              " rows but Spec expects ", .expected_n,
+              ". corpus_df will be reloaded from the Corpus sheet.")
+      rm(corpus_df, envir = .GlobalEnv)
+    } else {
+      message("✔ corpus_df matches Spec: ", nrow(corpus_df), " rows — reusing.")
+    }
+    rm(.spec_check)
+  }
+}
+# ******************************************
+
+# ******************************************
+# Corpus — load or generate
+# ******************************************
+.corpus_raw <- tryCatch(
+  openxlsx::read.xlsx(EXCEL_PATH, sheet = SH_CORP),
+  error = function(e) NULL
+)
+
+if (!is.null(.corpus_raw) && nrow(.corpus_raw) > 0) {
+
+  message("Corpus sheet found: ", nrow(.corpus_raw), " rows — loaded as-is.")
+  corpus_df <- .corpus_raw |>
+    dplyr::mutate(
+      label_bin = dplyr::case_when(
+        Label %in% POS_LABELS ~ "positive",
+        Label %in% NEG_LABELS ~ "negative",
+        TRUE                  ~ NA_character_
+      )
+    )
+
+} else {
+
+  message("Corpus sheet empty — generating from Spec…")
+  spec_df  <- openxlsx::read.xlsx(EXCEL_PATH, sheet = SH_SPEC)
+  spec_df  <- spec_df |> dplyr::filter(!is.na(Label), !is.na(Proportion))
+  n_items  <- as.integer(spec_df$n_items[1])
+  levels_k <- spec_df$Label
+  probs_k  <- spec_df$Proportion / sum(spec_df$Proportion)
+
+  set.seed(SEED)
+  counts    <- round(probs_k * n_items)
+  counts[1] <- n_items - sum(counts[-1])
+  label_vec <- sample(rep(levels_k, times = counts))
+
+  corpus_synth <- tibble::tibble(
+    ID       = seq_len(n_items),
+    Title    = paste("Synthetic reference", seq_len(n_items)),
+    Abstract = paste("Abstract placeholder for item", seq_len(n_items)),
+    Label    = label_vec
+  )
+
+  corpus_df <- corpus_synth |>
+    dplyr::mutate(
+      label_bin = dplyr::case_when(
+        Label %in% POS_LABELS ~ "positive",
+        Label %in% NEG_LABELS ~ "negative",
+        TRUE                  ~ NA_character_
+      )
+    )
+
+  wb <- openxlsx::loadWorkbook(EXCEL_PATH)
+  if (SH_CORP %in% names(wb)) openxlsx::removeWorksheet(wb, SH_CORP)
+  openxlsx::addWorksheet(wb, SH_CORP)
+  hs <- openxlsx::createStyle(textDecoration = "bold",
+                               fgFill = "#E2EFDA", border = "Bottom")
+  openxlsx::writeData(wb, SH_CORP, corpus_synth, headerStyle = hs)
+  openxlsx::saveWorkbook(wb, EXCEL_PATH, overwrite = TRUE)
+  message("✔ Synthetic corpus written to '", SH_CORP, "'")
+}
+
+n_items   <- nrow(corpus_df)
+prevalence <- mean(corpus_df$label_bin == "positive", na.rm = TRUE)
+message("Corpus ready: ", n_items, " items | prevalence = ",
+        round(prevalence, 3))
+rm(.corpus_raw)
+# ******************************************
+
+# ******************************************
+# Classifier profiles
+# ******************************************
+# Each profile defines a p_pos: probability of assigning a positive label.
+# lenient     — tends to include most items (high p_pos)
+# strict      — tends to exclude most items (low p_pos)
+# random      — pure 50/50 regardless of prevalence
+# prevalence  — mirrors the observed corpus prevalence
+# biased_pos  — strong positive bias
+# biased_neg  — strong negative bias
+
+.fixed_profiles <- tibble::tibble(
+  profile = c("lenient", "strict", "random",
+               "prevalence", "biased_pos", "biased_neg"),
+  p_pos   = c(0.75, 0.25, 0.50, prevalence, 0.90, 0.10)
+)
+
+set.seed(SEED)
+
+if (PROFILE == "fixed") {
+  profile_seq <- .fixed_profiles[
+    ((seq_len(N_CLASSIFIERS) - 1) %% nrow(.fixed_profiles)) + 1, ]
+  p_pos_vec   <- profile_seq$p_pos
+  label_vec   <- profile_seq$profile
+
+} else {
+  p_pos_vec <- runif(N_CLASSIFIERS,
+                      min = P_POS_RANGE[1], max = P_POS_RANGE[2])
+  label_vec <- paste0("random_", sprintf("%02d", seq_len(N_CLASSIFIERS)))
+}
+
+col_names <- paste0(label_vec, "_",
+                     sprintf("%02d", seq_len(N_CLASSIFIERS)))
+
+message("Classifier profiles assigned:")
+print(data.frame(Classifier = col_names, p_pos = round(p_pos_vec, 3)),
+      row.names = FALSE)
+# ******************************************
+
+# ******************************************
+# Generate classifications
+# ******************************************
+.classify_one <- function(p_pos, n) {
+  sample(c(POS_LABELS[1], NEG_LABELS[1]),
+         size = n, replace = TRUE,
+         prob = c(p_pos, 1 - p_pos))
+}
+
+sims_mat <- purrr::map2(p_pos_vec, col_names, function(p, nm) {
+  tibble::tibble(!!nm := .classify_one(p, n_items))
+}) |>
+  dplyr::bind_cols()
+
+sims_df <- tibble::tibble(ID = corpus_df$ID) |>
+  dplyr::bind_cols(sims_mat)
+
+message("✔ ", N_CLASSIFIERS, " classifiers generated: ",
+        nrow(sims_df), " items × ", ncol(sims_df) - 1, " classifiers")
+# ******************************************
+# ******************************************
+# Write Simulations to Excel
+# ******************************************
+# Saves to a new file with _hetero suffix to preserve the original.
+# EXCEL_PATH is updated so Module 4 points to the correct file.
+hetero_path <- sub("\\.xlsx$", "_hetero.xlsx", EXCEL_PATH, ignore.case = TRUE)
+
+wb <- openxlsx::loadWorkbook(EXCEL_PATH)
+
+if (SH_SIMS %in% names(wb)) openxlsx::removeWorksheet(wb, SH_SIMS)
+openxlsx::addWorksheet(wb, SH_SIMS)
+
+hs <- openxlsx::createStyle(textDecoration = "bold",
+                              fgFill = "#FFF2CC", border = "Bottom")
+openxlsx::writeData(wb, SH_SIMS, sims_df, headerStyle = hs)
+openxlsx::setColWidths(wb, SH_SIMS,
+                        cols = seq_len(ncol(sims_df)), widths = "auto")
+
+openxlsx::saveWorkbook(wb, hetero_path, overwrite = TRUE)
+EXCEL_PATH <- hetero_path
+message("✔ Simulations written to '", basename(EXCEL_PATH),
+        "' — original preserved — proceed to Module 4")
+# ******************************************
+```
