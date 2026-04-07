@@ -40,7 +40,7 @@ Any real classifier scoring above the upper bound of this interval can be consid
 
 ```
 ART-760/
-├── ART760_pipeline.qmd        # Main Quarto notebook — full pipeline
+├── ART-760 baseline class.qmd       # Main Quarto notebook — full pipeline
 ├── ART760_template.xlsx       # Blank Excel template to get started
 └── README.md
 ```
@@ -134,7 +134,7 @@ openxlsx, dplyr, purrr, tibble, rstudioapi
 
 ## Quick start
 
-1. Open `ART760_pipeline.qmd` in RStudio
+1. Open `ART-760 baseline class.qmd` in RStudio
 2. Set `EXCEL_PATH` and `EXCEL_FILE` in Module 0, or leave both `NULL` to use the file picker
 3. Set `POS_LABELS` and `NEG_LABELS` to match your corpus label values
 4. Run modules sequentially: **0 → 1 → 2 → 3 → 4**
